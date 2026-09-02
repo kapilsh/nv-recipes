@@ -1,0 +1,29 @@
+[project]
+name = "nv-recipes"
+version = "0.1.0"
+description = "Small scripts to test out CUDA and NCCL behaviors"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# torch is deliberately not a hard dependency: you may want a nightly, a stable
+# release, or your own local build, and the nightly index occasionally carries a
+# torch wheel whose pinned triton has not landed yet. See the README -- install
+# it explicitly after `uv sync`.
+dependencies = [
+    "cuda-python>=13.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+]
+
+[tool.uv]
+# Nightly wheels are pre-releases; without this uv refuses them.
+prerelease = "allow"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
