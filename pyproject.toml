@@ -13,6 +13,20 @@ dependencies = [
     "cuda-python>=13.0",
 ]
 
+[project.optional-dependencies]
+# recipes/gin_socket_ring.py: GIN over TCP sockets landed in NCCL 2.32.3, and
+# nccl4py 0.6.0 is the first release with bindings generated from 2.32.3. The
+# nvidia-nccl-cu13 wheel ships both libnccl.so and libnccl_device.bc.
+gin = [
+    "nccl4py[cu13]>=0.6.0",
+    "nvidia-nccl-cu13>=2.32.3",
+    "cupy-cuda13x[ctk]>=14.0",
+    # mpi4py wheels load whichever MPI is around; the mpich wheel supplies one
+    # (and mpiexec) on boxes without a system MPI.
+    "mpi4py>=4.0",
+    "mpich",
+]
+
 [dependency-groups]
 dev = [
     "ruff>=0.14",
