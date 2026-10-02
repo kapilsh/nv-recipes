@@ -2,9 +2,9 @@
 
 Small scripts to test out CUDA and NCCL behaviors.
 
-Each recipe is standalone and driven by `torchrun`. They talk to the CUDA driver
-through `cuda.bindings` directly, so every call's `CUresult` is visible and
-individual steps can be made to fail on individual ranks.
+Each recipe is standalone and driven by `torchrun`, or `mpiexec` where noted.
+They talk to CUDA and NCCL through Python bindings directly, so every call's
+result is visible and individual steps can be made to fail on individual ranks.
 
 ## Setup
 
@@ -168,3 +168,50 @@ torchrun --nproc_per_node=8 recipes/multicast_rendezvous.py --fail-rank 3 --fail
 reserved-but-unmapped case is the one a caller cannot distinguish from a live
 mapping, since `cuMemAddressReserve` writes the pointer before anything is
 mapped to it.
+
+### `recipes/gin_socket_ring.py`
+
+NCCL GIN (GPU-Initiated Networking) over plain TCP sockets, from Python through
+[nccl4py](https://github.com/NVIDIA/nccl/tree/master/bindings/nccl4py)'s CuTeDSL
+device API.
+
+NCCL 2.32.3 added a built-in socket RMA backend (`RMA_SOCKET_PROXY`,
+`src/transport/rma_socket*.cc`). The kernel posts puts and signals to the GIN
+proxy queue, and a CPU proxy thread moves the bytes over TCP, so no IB/RoCE NIC
+is needed. The recipe is a one-shot ring: each rank does a GPU-initiated
+`Gin.put` of 4 MiB into the next rank's window with a signal increment, waits
+for the previous rank's signal, and the host checks the data. MPI only
+broadcasts the NCCL unique id, so this recipe does not need torch.
+
+It needs NCCL >= 2.32.3 and nccl4py >= 0.6.0. The `gin` extra brings both, plus
+cupy, mpi4py and an MPICH wheel that supplies `mpiexec`. The `nvidia-nccl-cu13`
+wheel ships both `libnccl.so` and the `libnccl_device.bc` that nccl4py's CuTeDSL
+API links against, so no source build is needed. To use your own NCCL build
+instead, point `NCCL_HOME` at it (with `libnccl_device.bc` from
+`make -C bindings/ir`).
+
+`uv sync --extra gin` removes torch, which is not in the lock; reinstall it
+afterwards if you also want the other recipes in the same venv.
+
+```bash
+uv sync --extra gin
+source .venv/bin/activate
+export NCCL_GDRCOPY_ENABLE=1 NCCL_IB_DISABLE=1
+
+mpiexec -n 2 python recipes/gin_socket_ring.py
+
+# two nodes, 1 GPU each, for a real TCP path
+mpiexec -n 2 -ppn 1 -hosts node1,node2 python recipes/gin_socket_ring.py
+```
+
+| variable | why |
+|---|---|
+| `NCCL_GDRCOPY_ENABLE=1` | required; the socket backend refuses to start without GDRCopy, which is off by default |
+| `NCCL_IB_DISABLE=1` | the IB GDAKI and IB proxy backends are tried before sockets |
+| `NCCL_SOCKET_IFNAME` | optional; picks the TCP interface |
+| `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET` | look for `RMA/Plugin: Assigned plugin RMA_SOCKET_PROXY` |
+
+GDRCopy comes from either `libgdrapi.so` plus the `gdrdrv` kernel module, or
+NCCL's internal DMA-BUF fallback, which needs a CUDA driver >= 13.3. Without
+either, NCCL logs `rma_socket requires GDRCopy; and GDR Copy is not available`
+and the communicator comes up with `gin_type=NONE`.
