@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# recipes/symm_mem_rendezvous_leak.py output
+reports/

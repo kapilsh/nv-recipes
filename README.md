@@ -168,3 +168,43 @@ torchrun --nproc_per_node=8 recipes/multicast_rendezvous.py --fail-rank 3 --fail
 reserved-but-unmapped case is the one a caller cannot distinguish from a live
 mapping, since `cuMemAddressReserve` writes the pointer before anything is
 mapped to it.
+
+### `recipes/symm_mem_rendezvous_leak.py`
+
+Checks whether a rejected CUDA SymmetricMemory rendezvous leaks GPU memory
+([pytorch/pytorch#199896](https://github.com/pytorch/pytorch/issues/199896)).
+Unlike the other recipes this one drives real `torch.distributed._symmetric_memory`,
+so it tests whatever torch you have installed.
+
+`make_peer_alloc_info()` exports the block as a POSIX fd *before* it validates
+the rendezvous requests, and only closes that fd after a successful import loop.
+Any throw in between leaves the fd open, and the open fd keeps the physical
+allocation alive after the tensor is freed. Fabric handles have no fd, so the
+validation failures do not leak there.
+
+```bash
+torchrun --nproc_per_node=2 recipes/symm_mem_rendezvous_leak.py                 # torch's choice
+torchrun --nproc_per_node=2 recipes/symm_mem_rendezvous_leak.py --handle posix  # force the fd path
+```
+
+| scenario | what happens |
+|---|---|
+| `ok` | control: own GPU per rank, same size, rendezvous succeeds |
+| `size` | odd ranks allocate 2x, rejected by the `block_size` check |
+| `overlap` | every rank on `cuda:0`, rejected by the overlapping-devices check (the issue's repro) |
+| `overlap-close` | `overlap`, then close the `/dev/nvidia*` fds each failure left open |
+
+Each scenario loops allocate, rendezvous (error caught), free, and tracks free
+device memory and open fds. If `overlap` leaks and `overlap-close` does not, the
+leftover exported fd is what pins the memory.
+
+On fabric-capable boxes (H100/GB200 with an IMEX channel) torch always picks
+fabric handles and has no knob to override it. `--handle posix` re-execs each
+rank with a small `LD_PRELOAD` shim, built once with `cc` into
+`~/.cache/nv-recipes/`, that makes `nvmlDeviceGetGpuFabricInfoV` report
+NOT_SUPPORTED. The report states which path torch actually took, read from its
+INFO log.
+
+Rank 0 prints a verdict table and writes `report.md`, `report.json` and per-rank
+torch logs to `reports/symm_mem_leak-<time>-<host>-<handle>/` (override with
+`--outdir`). Other knobs: `--scenarios`, `--iters`, `--mib`.
