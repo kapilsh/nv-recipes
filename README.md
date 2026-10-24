@@ -208,3 +208,42 @@ INFO log.
 Rank 0 prints a verdict table and writes `report.md`, `report.json` and per-rank
 torch logs to `reports/symm_mem_leak-<time>-<host>-<handle>/` (override with
 `--outdir`). Other knobs: `--scenarios`, `--iters`, `--mib`.
+
+### `recipes/symm_mem_alloc_rollback.py`
+
+Checks the guards in [pytorch/pytorch#201284](https://github.com/pytorch/pytorch/pull/201284),
+which rolls back a partially set-up CUDA VMM allocation in
+`CUDASymmetricMemoryAllocator::alloc()` and `map_block()`. Replays `alloc()`,
+`map_block()`, one peer of the import loop and `MulticastSetup::bind_and_map()`
+over `cuda.bindings`, injects a failure at each step, and reports what is still
+held afterwards.
+
+```bash
+python recipes/symm_mem_alloc_rollback.py                   # every path, every arm
+python recipes/symm_mem_alloc_rollback.py --paths alloc --trace
+```
+
+One process, no torch, no torchrun. `peer` and `mc` need a second GPU (`--peer`).
+
+Arms: `base` is the code before the PR, `fix` is the PR, and `fix-<guard>` is the
+PR with one guard taken out. A guard whose removal changes no cell is
+**redundant**. One that only matters for steps marked `*` (a sticky context
+error, `std::bad_alloc`, or a second fault during rollback) is **defensive
+only**.
+
+| guard | what it does |
+|---|---|
+| `unwind` | `map_block` undoes its own reserve/map when a later step throws |
+| `late_publish` | `map_block` writes `*ptr` only once the mapping is complete |
+| `unmap_gate` | a rollback skips `cuMemAddressFree` when its `cuMemUnmap` failed |
+| `alloc_release` | `alloc()` scope guard releases the handle until `AllocationRef` owns it |
+| `alloc_unmap` | that guard also unmaps/frees `alloc_base` if it was published |
+| `early_owner` | `AllocationRef` is built before the memset/sync instead of after |
+
+What is held comes from a ledger of the driver calls, free device memory
+before and after (`P<n>` = MiB pinned), and a reaper whose `CUDA_SUCCESS` is the
+driver confirming each leftover was really live. A short "driver facts" section
+first measures the driver behaviour the guards depend on, for example whether
+`cuMemAddressFree` on a mapped VA is refused, and whether a freed VA comes back
+from the next reserve. `--iters N` repeats each case to show leaks accumulating.
+`--json` dumps every cell.
