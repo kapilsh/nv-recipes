@@ -225,8 +225,10 @@ python recipes/symm_mem_alloc_rollback.py --paths alloc --trace
 
 One process, no torch, no torchrun. `peer` and `mc` need a second GPU (`--peer`).
 
-Arms: `base` is the code before the PR, `fix` is the PR, and `fix-<guard>` is the
-PR with one guard taken out. A guard whose removal changes no cell is
+Arms: `old` is the code before
+[#201842](https://github.com/pytorch/pytorch/pull/201842) (teardown never frees
+the VA), `base` is main with #201842, `fix` is `base` plus the PR, and
+`fix-<guard>` is `fix` with one guard taken out. A guard whose removal changes no cell is
 **redundant**. One that only matters for steps marked `*` (a sticky context
 error, `std::bad_alloc`, or a second fault during rollback) is **defensive
 only**.

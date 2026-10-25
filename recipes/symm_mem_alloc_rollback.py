@@ -10,9 +10,10 @@ step can be made to fail, and the run then reports what is still held.
 
 The PR adds several guards. Each one is a separate switch, so the probe runs:
 
-    base          the code before the PR
-    fix           the PR as written
-    fix-<guard>   the PR with that one guard removed
+    old           before #201842 and the PR: teardown never frees the VA
+    base          main with #201842: teardown frees the VA, no PR
+    fix           base plus the PR as written
+    fix-<guard>   fix with that one guard removed
 
 A guard that can be dropped without making any injected failure worse is not
 protecting anything. One that only matters for failures that cannot happen
@@ -89,10 +90,15 @@ GUARDS = {
     "alloc_unmap": "that guard also unmaps/frees alloc_base if it was published",
     "early_owner": "AllocationRef is built before the memset/sync instead of after",
 }
+# Landed in pytorch/pytorch#201842: ~AllocationRef and MulticastSetup::release()
+# call cuMemAddressFree after the unmap (not gated on the unmap succeeding).
+TEARDOWN_FREE = "teardown_free"
+FIX = frozenset(GUARDS) | {TEARDOWN_FREE}
 ARMS: dict[str, frozenset[str]] = {
-    "base": frozenset(),
-    "fix": frozenset(GUARDS),
-    **{f"fix-{g}": frozenset(GUARDS) - {g} for g in GUARDS},
+    "old": frozenset(),
+    "base": frozenset({TEARDOWN_FREE}),
+    "fix": FIX,
+    **{f"fix-{g}": FIX - {g} for g in GUARDS},
 }
 
 
@@ -273,25 +279,31 @@ class Out:
 
 @dataclass
 class AllocationRef:
-    """~AllocationRef: unmap, then release. No cuMemAddressFree -- that
-    normal-path VA leak is pytorch/pytorch#201091's separate follow-up."""
+    """~AllocationRef: unmap, unbind (multicast), free the VA (#201842 only),
+    release. The free is not gated on the unmap succeeding."""
 
     L: Ledger
+    g: frozenset[str]
     ptr: int
     handle: int
     size: int
+    mc_unbind: Callable[[], Any] | None = None
 
     def destroy(self) -> None:
         self.L.unmap(self.ptr, self.size)
+        if self.mc_unbind is not None:
+            self.L.warn("unbind", "cuMulticastUnbind", self.mc_unbind)
+        if TEARDOWN_FREE in self.g:
+            self.L.addr_free(self.ptr, self.size)
         if self.handle:
             self.L.release(self.handle)
 
 
-def new_owner(L: Ledger, ptr: int, handle: int, size: int) -> AllocationRef:
+def new_owner(L: Ledger, g: frozenset[str], ptr: int, handle: int, size: int) -> AllocationRef:
     if L.injected("owner"):
         L.trace.append(f"make_intrusive<AllocationRef> -> {INJECTED}")
         raise DriverError("owner", "std::bad_alloc")
-    return AllocationRef(L, ptr, handle, size)
+    return AllocationRef(L, g, ptr, handle, size)
 
 
 def map_block(
@@ -341,12 +353,12 @@ def alloc(L: Ledger, g: frozenset[str], env: Env) -> AllocationRef:
     try:
         map_block(L, g, out, h, size, env.dev, 0)
         if "early_owner" in g:
-            owner = new_owner(L, out.v, h, size)
+            owner = new_owner(L, g, out.v, h, size)
             armed = False  # rollback.release()
         L.check("memset", "cudaMemsetAsync", lambda: drv.cuMemsetD8(out.v, 0, min(size, MiB)))
         L.check("sync", "cudaStreamSynchronize", drv.cuCtxSynchronize)
         if owner is None:
-            owner = new_owner(L, out.v, h, size)
+            owner = new_owner(L, g, out.v, h, size)
             armed = False
         return owner
     except DriverError:
@@ -391,7 +403,7 @@ def run_peer(L: Ledger, g: frozenset[str], env: Env) -> str:
         out = Out()
         map_block(L, g, out, handle, size, env.dev, 0)
         L.close_fd(received)
-        ref = AllocationRef(L, out.v, handle, size)
+        ref = AllocationRef(L, g, out.v, handle, size)
     except DriverError as exc:
         result = f"threw:{exc.step}"
     if ref is not None:
@@ -420,16 +432,21 @@ def run_mc(L: Ledger, g: frozenset[str], env: Env) -> str:
     addr, ref, result = Out(), None, "ok"
     try:
         map_block(L, g, addr, mc, size, env.dev, env.mc_align)
-        ref = AllocationRef(L, addr.v, 0, size)  # commit(); the harness owns mc
+        # commit(): the AllocationRef owns the mapping and unbinds env.dev; the
+        # harness owns the multicast handle itself.
+        unbind = lambda: drv.cuMulticastUnbind(mc, int(env.cudev[env.dev]), 0, size)  # noqa: E731
+        ref = AllocationRef(L, g, addr.v, 0, size, unbind)
         addr.v = 0
     except DriverError as exc:
         result = f"threw:{exc.step}"  # bind_and_map() returns false
-    if addr.v:  # MulticastSetup::release(): unmap addr_, never cuMemAddressFree
+    if addr.v:  # MulticastSetup::release(): unmap addr_, then (#201842) free it
         L.unmap(addr.v, size, "release_unmap")
+        if TEARDOWN_FREE in g:
+            L.addr_free(addr.v, size)
         addr.v = 0
     if ref is not None:
         ref.destroy()
-    for d in devs:
+    for d in devs if ref is None else (env.peer,):
         H.warn(
             "mc",
             "cuMulticastUnbind",
@@ -768,12 +785,17 @@ def main() -> int:
             for t in v["better"]:
                 print(f"      better  {t}")
 
-    if "base" in args.arms and "fix" in args.arms:
-        print("\nbase -> fix:")
+    for before, after, what in (
+        ("old", "base", "#201842 (teardown frees the VA)"),
+        ("base", "fix", "the PR on top of main"),
+    ):
+        if before not in args.arms or after not in args.arms:
+            continue
+        print(f"\n{before} -> {after}: {what}")
         for (path, arm, step), c in cells.items():
-            if arm != "base":
+            if arm != before:
                 continue
-            f = cells[(path, "fix", step)]
+            f = cells[(path, after, step)]
             if c.score() != f.score() or f.short() != "clean":
                 print(f"  {path}/{step:<17} {c.short():<16} -> {f.short()}")
 
